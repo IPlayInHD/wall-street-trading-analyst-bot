@@ -35,8 +35,8 @@ class RiskConfig:
     max_position_usd: Decimal = field(default_factory=lambda: _decimal("MAX_POSITION_USD", "10000"))
     max_daily_loss_usd: Decimal = field(default_factory=lambda: _decimal("MAX_DAILY_LOSS_USD", "500"))
     max_drawdown_pct: Decimal = field(default_factory=lambda: _decimal("MAX_DRAWDOWN_PCT", "0.05"))
-    min_profit_threshold_bps: Decimal = field(default_factory=lambda: _decimal("MIN_PROFIT_THRESHOLD_BPS", "3"))
-    max_slippage_bps: Decimal = field(default_factory=lambda: _decimal("MAX_SLIPPAGE_BPS", "5"))
+    min_profit_threshold_bps: Decimal = field(default_factory=lambda: _decimal("MIN_PROFIT_THRESHOLD_BPS", "15"))
+    max_slippage_bps: Decimal = field(default_factory=lambda: _decimal("MAX_SLIPPAGE_BPS", "8"))
     order_timeout_ms: int = int(_env("ORDER_TIMEOUT_MS", "500"))
     position_close_timeout_ms: int = int(_env("POSITION_CLOSE_TIMEOUT_MS", "2000"))
 

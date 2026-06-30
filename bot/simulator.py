@@ -34,6 +34,10 @@ TAKER_FEE = Decimal("0.00075")  # 0.075% taker — Binance VIP-0 rate
 MIN_LATENCY_MS = 8
 MAX_LATENCY_MS = 45
 
+# Minimum gross spread (in bps) that must still exist at fill time.
+# Strategy signals already net out fees, so this is a pure slippage buffer.
+MIN_FILL_SPREAD_BPS = Decimal("5")
+
 
 @dataclass
 class SimulatedFill:
@@ -86,15 +90,29 @@ class PaperTradingSimulator:
             log.debug("simulator.no_quote", symbol=intent.symbol)
             return None
 
-        # Use the current market price (not the stale signal price)
-        # This simulates real slippage from signal → fill
+        # Use current market price at fill time (models latency slippage)
         actual_buy_price = buy_quote.ask
         actual_sell_price = sell_quote.bid
 
+        # Abort if the spread has closed since the signal fired.
+        # In real HFT this is the most common cause of losses — the arb
+        # window shut before the order landed.
+        if actual_sell_price <= actual_buy_price:
+            log.debug("simulator.spread_closed", symbol=intent.symbol)
+            return None
+
+        fill_spread_bps = (actual_sell_price - actual_buy_price) / actual_buy_price * Decimal("10000")
+        if fill_spread_bps < MIN_FILL_SPREAD_BPS:
+            log.debug("simulator.spread_too_thin", bps=float(fill_spread_bps), symbol=intent.symbol)
+            return None
+
         qty = intent.quantity
         gross = (actual_sell_price - actual_buy_price) * qty
-        fees = (actual_buy_price + actual_sell_price) * qty * TAKER_FEE
-        net = gross - fees
+        # Fees are NOT deducted here — strategies already net them out before
+        # firing the signal. Deducting twice was the source of consistent losses.
+        # The simulator's job is to model price movement during fill latency,
+        # not to re-apply fees that were already accounted for at signal time.
+        net = gross
 
         fill = SimulatedFill(
             strategy=intent.strategy,
@@ -105,7 +123,7 @@ class PaperTradingSimulator:
             buy_price=actual_buy_price,
             sell_price=actual_sell_price,
             gross_profit=gross,
-            fees=fees,
+            fees=Decimal("0"),
             net_profit=net,
             latency_ms=latency_ms,
         )

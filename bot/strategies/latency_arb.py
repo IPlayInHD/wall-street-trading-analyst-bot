@@ -43,7 +43,7 @@ FAST_QUOTE_MAX_AGE_MS = 5.0
 # How long to suppress signals for the same (symbol, exchange_pair) after firing
 COOLDOWN_MS = 200.0
 # Min edge in BPS after fees to bother trading
-MIN_EDGE_BPS = Decimal("4")
+MIN_EDGE_BPS = Decimal("12")
 
 
 @dataclass

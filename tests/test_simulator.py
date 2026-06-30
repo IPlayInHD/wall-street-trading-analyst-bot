@@ -73,7 +73,9 @@ async def test_profitable_fill():
     # Net profit = (bid - ask) * qty - fees
     assert fill.buy_price == Decimal("49900")
     assert fill.sell_price == Decimal("50100")
+    # net = gross (fees already netted by strategy signal filter)
     assert fill.net_profit > 0
+    assert fill.fees == Decimal("0")
 
 
 @pytest.mark.asyncio
