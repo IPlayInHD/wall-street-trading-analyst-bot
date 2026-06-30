@@ -13,6 +13,7 @@ Press Ctrl-C to stop and print session summary.
 
 import asyncio
 import signal
+import webbrowser
 
 try:
     import uvloop
@@ -56,6 +57,11 @@ async def main() -> None:
         loop.add_signal_handler(sig, _on_signal, sig)
 
     engine_task = asyncio.create_task(engine.start())
+
+    # Give the dashboard server a moment to bind before opening browser
+    await asyncio.sleep(1.5)
+    webbrowser.open("http://localhost:8080")
+    print("  Dashboard: http://localhost:8080\n")
 
     await stop_event.wait()
     engine_task.cancel()

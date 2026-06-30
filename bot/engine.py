@@ -43,6 +43,7 @@ import signal as _signal
 from typing import List
 
 from bot.config import CONFIG
+from bot.dashboard import Dashboard
 from bot.exchange_factory import build_exchanges
 from bot.logger import log
 from bot.market_data import MarketDataFeed, Quote
@@ -79,6 +80,7 @@ class TradingEngine:
         self._risk = RiskEngine()
         self._feed: MarketDataFeed | None = None
         self._simulator: PaperTradingSimulator | None = None
+        self._dashboard: Dashboard | None = None
         self._signal_queue: asyncio.Queue = asyncio.Queue(maxsize=2000)
 
         self._cross_arb: CrossExchangeArb | None = None
@@ -96,6 +98,9 @@ class TradingEngine:
         self._cross_arb = CrossExchangeArb(self._feed, self._symbols)
         self._stat_arbs = [StatisticalArb(name) for name in exchanges]
 
+        self._dashboard = Dashboard(self._simulator, self._risk)
+        await self._dashboard.start(port=8080)
+
         self._feed.subscribe(self._on_quote)
         await self._feed.start()
 
@@ -103,7 +108,7 @@ class TradingEngine:
             "engine.live",
             exchanges=list(exchanges.keys()),
             symbols=self._symbols,
-            note="Paper trading — watching live prices, no real orders",
+            dashboard="http://localhost:8080",
         )
 
         await self._process_signals()
@@ -123,24 +128,32 @@ class TradingEngine:
             intent = self._cross_arb.on_quote(quote)
             if intent:
                 SIGNAL_COUNT.labels(strategy="cross_exchange_arb").inc()
+                if self._dashboard:
+                    self._dashboard.increment_signal()
                 self._try_enqueue(("intent", intent))
 
         if CONFIG.enable_triangular_arb:
             signal = self._tri_arb.on_quote(quote)
             if signal:
                 SIGNAL_COUNT.labels(strategy="triangular_arb").inc()
+                if self._dashboard:
+                    self._dashboard.increment_signal()
                 self._try_enqueue(("tri", signal))
 
         if CONFIG.enable_latency_arb:
             intent = self._lat_arb.on_quote(quote)
             if intent:
                 SIGNAL_COUNT.labels(strategy="latency_arb").inc()
+                if self._dashboard:
+                    self._dashboard.increment_signal()
                 self._try_enqueue(("intent", intent))
 
         if CONFIG.enable_statistical_arb:
             for stat in self._stat_arbs:
                 for intent in stat.on_quote(quote):
                     SIGNAL_COUNT.labels(strategy="statistical_arb").inc()
+                    if self._dashboard:
+                        self._dashboard.increment_signal()
                     self._try_enqueue(("intent", intent))
 
     def _try_enqueue(self, item) -> None:
