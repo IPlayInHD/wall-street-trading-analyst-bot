@@ -1,185 +1,170 @@
 """
 Main trading engine — wires all components together.
 
-Architecture (inspired by Jane Street / Citadel prop desk design):
+Runs fully without API keys using real live market data from public
+WebSocket feeds and the paper trading simulator for order execution.
 
+Architecture:
   ┌─────────────────────────────────────────────────────┐
-  │                   MarketDataFeed                    │
-  │  Binance WS ─┐                                      │
-  │  Bybit WS   ─┼──► quote callbacks (non-blocking)   │
-  │  Kraken WS  ─┘                                      │
+  │               MarketDataFeed (public WS)            │
+  │  Binance ─┐                                         │
+  │  Bybit   ─┼──► quote callbacks (µs, non-blocking)  │
+  │  Kraken  ─┤                                         │
+  │  OKX     ─┘                                         │
   └──────────────────────┬──────────────────────────────┘
                          │ Quote
                ┌─────────▼──────────┐
-               │   Strategy Bus     │  (sync, sub-microsecond)
-               │  CrossExchangeArb  │
-               │  TriangularArb     │
-               │  LatencyArb        │
-               │  StatisticalArb    │
+               │   Strategy Bus     │
+               │  ① CrossExchange   │
+               │  ② Triangular      │
+               │  ③ LatencyArb      │
+               │  ④ StatisticalArb  │
                └─────────┬──────────┘
                          │ TradeIntent / Signal
                ┌─────────▼──────────┐
-               │    RiskEngine      │  pre-trade checks
+               │    RiskEngine      │  7-layer pre-trade gate
                └─────────┬──────────┘
                          │ approved
                ┌─────────▼──────────┐
-               │  ExecutionEngine   │  dual-leg IOC orders
+               │  PaperTrading      │  simulated fills on live prices
+               │  Simulator         │
                └─────────┬──────────┘
-                         │ fills
+                         │ SimulatedFill
                ┌─────────▼──────────┐
-               │  RiskEngine.record │  post-trade PnL accounting
+               │  P&L Ledger +      │
+               │  Prometheus /metrics│
                └────────────────────┘
 """
 
 from __future__ import annotations
 
 import asyncio
-from typing import Dict, List
-
-import ccxt.pro as ccxtpro
+import signal as _signal
+from typing import List
 
 from bot.config import CONFIG
-from bot.execution import ExecutionEngine
 from bot.exchange_factory import build_exchanges
 from bot.logger import log
 from bot.market_data import MarketDataFeed, Quote
 from bot.metrics import (
     DAILY_PNL,
     DRAWDOWN_PCT,
-    REJECTION_COUNT,
     SIGNAL_COUNT,
     SPREAD_BPS,
     start_metrics_server,
 )
-from bot.risk import RejectionReason, RiskEngine
+from bot.risk import RiskEngine
+from bot.simulator import PaperTradingSimulator
 from bot.strategies.cross_exchange import CrossExchangeArb
 from bot.strategies.latency_arb import LatencyArb
 from bot.strategies.statistical import StatisticalArb
 from bot.strategies.triangular import TriangularArb
 
-# Default universe — high liquidity, tight spreads, global coverage
 DEFAULT_SYMBOLS: List[str] = [
     "BTC/USDT",
     "ETH/USDT",
     "SOL/USDT",
     "BNB/USDT",
     "XRP/USDT",
-    "AVAX/USDT",
-    "MATIC/USDT",
-    "DOT/USDT",
     "ETH/BTC",
-    "SOL/BTC",
-    "XRP/BTC",
-    "BNB/BTC",
     "SOL/ETH",
-    "MATIC/ETH",
+    "BNB/BTC",
+    "XRP/BTC",
 ]
 
 
 class TradingEngine:
-    """
-    Orchestrates the full HFT pipeline from market data ingestion to
-    order execution and risk accounting.
-    """
-
     def __init__(self, symbols: List[str] = DEFAULT_SYMBOLS) -> None:
         self._symbols = symbols
-        self._exchanges: Dict[str, ccxtpro.Exchange] = {}
-        self._feed: MarketDataFeed | None = None
         self._risk = RiskEngine()
-        self._exec: ExecutionEngine | None = None
-        self._signal_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
+        self._feed: MarketDataFeed | None = None
+        self._simulator: PaperTradingSimulator | None = None
+        self._signal_queue: asyncio.Queue = asyncio.Queue(maxsize=2000)
 
-        # Strategy engines
         self._cross_arb: CrossExchangeArb | None = None
         self._tri_arb = TriangularArb()
         self._lat_arb = LatencyArb(symbols)
         self._stat_arbs: List[StatisticalArb] = []
 
     async def start(self) -> None:
-        log.info("engine.starting", dry_run=CONFIG.dry_run)
+        log.info("engine.starting", mode="paper_trading_live_data")
         start_metrics_server()
 
-        self._exchanges = build_exchanges()
-        self._feed = MarketDataFeed(self._exchanges, self._symbols)
-        self._exec = ExecutionEngine(self._exchanges, self._risk)
+        exchanges = build_exchanges()
+        self._feed = MarketDataFeed(exchanges, self._symbols)
+        self._simulator = PaperTradingSimulator(self._feed, self._risk)
         self._cross_arb = CrossExchangeArb(self._feed, self._symbols)
-        self._stat_arbs = [StatisticalArb(ex) for ex in self._exchanges]
+        self._stat_arbs = [StatisticalArb(name) for name in exchanges]
 
-        # Register the unified callback
         self._feed.subscribe(self._on_quote)
-
         await self._feed.start()
-        log.info("engine.running", exchanges=list(self._exchanges.keys()))
 
-        # Run signal processor alongside feed tasks
+        log.info(
+            "engine.live",
+            exchanges=list(exchanges.keys()),
+            symbols=self._symbols,
+            note="Paper trading — watching live prices, no real orders",
+        )
+
         await self._process_signals()
 
     async def stop(self) -> None:
-        log.info("engine.stopping")
         if self._feed:
             await self._feed.stop()
+        if self._simulator:
+            self._simulator.print_summary()
 
     def _on_quote(self, quote: Quote) -> None:
-        """
-        Hot path — called synchronously on every WebSocket message.
-        Must complete in <100 µs.  Heavy work is queued.
-        """
-        # Update Prometheus spread gauge
         SPREAD_BPS.labels(exchange=quote.exchange, symbol=quote.symbol).set(
             float(quote.spread_bps)
         )
 
-        # Cross-exchange arb (requires quotes from ≥2 exchanges)
         if CONFIG.enable_cross_exchange_arb and self._cross_arb:
             intent = self._cross_arb.on_quote(quote)
             if intent:
                 SIGNAL_COUNT.labels(strategy="cross_exchange_arb").inc()
-                self._signal_queue.put_nowait(("intent", intent))
+                self._try_enqueue(("intent", intent))
 
-        # Triangular arb (within same exchange)
         if CONFIG.enable_triangular_arb:
             signal = self._tri_arb.on_quote(quote)
             if signal:
                 SIGNAL_COUNT.labels(strategy="triangular_arb").inc()
-                self._signal_queue.put_nowait(("tri", signal))
+                self._try_enqueue(("tri", signal))
 
-        # Latency arb
         if CONFIG.enable_latency_arb:
             intent = self._lat_arb.on_quote(quote)
             if intent:
                 SIGNAL_COUNT.labels(strategy="latency_arb").inc()
-                self._signal_queue.put_nowait(("intent", intent))
+                self._try_enqueue(("intent", intent))
 
-        # Statistical arb
         if CONFIG.enable_statistical_arb:
             for stat in self._stat_arbs:
                 for intent in stat.on_quote(quote):
                     SIGNAL_COUNT.labels(strategy="statistical_arb").inc()
-                    self._signal_queue.put_nowait(("intent", intent))
+                    self._try_enqueue(("intent", intent))
+
+    def _try_enqueue(self, item) -> None:
+        try:
+            self._signal_queue.put_nowait(item)
+        except asyncio.QueueFull:
+            pass  # drop signal if queue is saturated — risk > throughput
 
     async def _process_signals(self) -> None:
-        """Drain the signal queue and execute approved intents."""
         while True:
             try:
                 item = await asyncio.wait_for(self._signal_queue.get(), timeout=1.0)
-                signal_type, payload = item
+                sig_type, payload = item
 
-                if signal_type == "intent":
-                    result = await self._exec.execute(payload)
-                    if result:
-                        DAILY_PNL.set(float(self._risk.state.realized_pnl))
-                        DRAWDOWN_PCT.set(float(self._risk.state.drawdown))
-                    else:
-                        pass  # rejection already logged inside risk/exec
-
-                elif signal_type == "tri":
+                if sig_type == "intent":
+                    await self._simulator.execute(payload)
+                elif sig_type == "tri":
                     await self._execute_triangle(payload)
 
+                DAILY_PNL.set(float(self._risk.state.realized_pnl))
+                DRAWDOWN_PCT.set(float(self._risk.state.drawdown))
                 self._signal_queue.task_done()
 
             except asyncio.TimeoutError:
-                # Idle tick — update PnL gauge
                 DAILY_PNL.set(float(self._risk.state.realized_pnl))
             except asyncio.CancelledError:
                 break
@@ -188,38 +173,40 @@ class TradingEngine:
 
     async def _execute_triangle(self, signal) -> None:
         """
-        Execute three sequential IOC orders for triangular arb.
-        Sequential (not concurrent) because each leg funds the next.
+        Simulate a triangular arb by constructing a synthetic TradeIntent
+        for the first two legs (the system logs the opportunity).
         """
         from bot.risk import TradeIntent
         from decimal import Decimal
 
-        exchange = self._exchanges.get(signal.exchange)
-        if not exchange:
+        feed = self._feed
+        ex = signal.exchange
+        legs = signal.legs
+        dirs = signal.directions
+
+        # Fetch live quotes for each leg
+        q0 = feed.get_quote(ex, legs[0])
+        q1 = feed.get_quote(ex, legs[1])
+        q2 = feed.get_quote(ex, legs[2])
+        if not (q0 and q1 and q2):
             return
 
-        entry = signal.entry_usdt
-        legs = signal.legs
-        directions = signal.directions
+        # For simulation, model the triangle as a cross-exchange intent
+        # (buy leg-0, sell leg-2 in USDT terms) so the simulator can fill it
+        buy_px = q0.ask if dirs[0] == "buy" else q0.bid
+        sell_px = q2.bid if dirs[2] == "sell" else q2.ask
+        qty = signal.entry_usdt / buy_px
 
-        log.info(
-            "engine.triangle_execute",
-            exchange=signal.exchange,
-            legs=legs,
-            profit_pct=float(signal.profit_pct),
-            dry_run=CONFIG.dry_run,
+        intent = TradeIntent(
+            strategy="triangular_arb",
+            exchange_buy=ex,
+            exchange_sell=ex,
+            symbol=legs[0],
+            quantity=qty,
+            expected_buy_price=buy_px,
+            expected_sell_price=sell_px,
+            estimated_profit_usd=signal.entry_usdt * signal.profit_pct / Decimal("100"),
+            estimated_slippage_bps=Decimal("2"),
+            quote_age_ms=signal.quote_age_ms,
         )
-
-        if CONFIG.dry_run:
-            return  # logged above, don't place real orders
-
-        try:
-            # Build TradeIntents for each leg sequentially
-            # Leg amounts cascade from the output of each prior leg
-            running_qty = entry
-            for sym, direction in zip(legs, directions):
-                side = "buy" if direction == "buy" else "sell"
-                qty = running_qty / Decimal("1")  # simplified; real impl tracks intermediate asset
-                await exchange.create_order(sym, "market", side, float(qty))
-        except Exception as exc:
-            log.error("engine.triangle_error", error=str(exc))
+        await self._simulator.execute(intent)

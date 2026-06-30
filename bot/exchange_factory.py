@@ -1,10 +1,9 @@
 """
 Exchange initialisation factory.
 
-Builds ccxt.pro async exchange instances with institutional-grade settings:
-  • rate limiting respect
-  • WebSocket connection pooling
-  • unified error handling
+No API keys required.  All exchanges connect via public WebSocket feeds
+for real live market data.  Order execution is handled by the paper
+trading simulator (bot/simulator.py).
 """
 
 from __future__ import annotations
@@ -13,64 +12,35 @@ from typing import Dict
 
 import ccxt.pro as ccxtpro
 
-from bot.config import CONFIG
 from bot.logger import log
+
+# All exchanges supported via unauthenticated public order-book feeds
+PUBLIC_EXCHANGES = {
+    "binance": lambda: ccxtpro.binance({"enableRateLimit": True, "options": {"defaultType": "spot"}}),
+    "bybit":   lambda: ccxtpro.bybit({"enableRateLimit": True, "options": {"defaultType": "spot"}}),
+    "kraken":  lambda: ccxtpro.kraken({"enableRateLimit": True}),
+    "okx":     lambda: ccxtpro.okx({"enableRateLimit": True}),
+}
 
 
 def build_exchanges() -> Dict[str, ccxtpro.Exchange]:
     """
-    Instantiate all configured exchanges.  Exchanges with missing API keys
-    are skipped (safe to run with partial credentials for testing).
+    Connect to all exchanges using public feeds only.
+    No API keys are required — market data is free and unauthenticated.
     """
-    candidates = {
-        "binance": lambda: ccxtpro.binance({
-            "apiKey": CONFIG.binance.api_key,
-            "secret": CONFIG.binance.secret,
-            "enableRateLimit": True,
-            "options": {"defaultType": "spot", "adjustForTimeDifference": True},
-        }),
-        "coinbase": lambda: ccxtpro.coinbase({
-            "apiKey": CONFIG.coinbase.api_key,
-            "secret": CONFIG.coinbase.secret,
-            "enableRateLimit": True,
-        }),
-        "kraken": lambda: ccxtpro.kraken({
-            "apiKey": CONFIG.kraken.api_key,
-            "secret": CONFIG.kraken.secret,
-            "enableRateLimit": True,
-        }),
-        "bybit": lambda: ccxtpro.bybit({
-            "apiKey": CONFIG.bybit.api_key,
-            "secret": CONFIG.bybit.secret,
-            "enableRateLimit": True,
-            "options": {"defaultType": "spot"},
-        }),
-        "okx": lambda: ccxtpro.okx({
-            "apiKey": CONFIG.okx.api_key,
-            "secret": CONFIG.okx.secret,
-            "password": CONFIG.okx.passphrase,
-            "enableRateLimit": True,
-        }),
-    }
-
     exchanges: Dict[str, ccxtpro.Exchange] = {}
-    for name, factory in candidates.items():
-        creds = getattr(CONFIG, name)
-        if not creds.api_key:
-            log.info("exchange_factory.skipped", exchange=name, reason="no_api_key")
-            continue
+    for name, factory in PUBLIC_EXCHANGES.items():
         try:
             ex = factory()
             exchanges[name] = ex
-            log.info("exchange_factory.connected", exchange=name)
+            log.info("exchange_factory.connected", exchange=name, mode="public_feed")
         except Exception as exc:
-            log.error("exchange_factory.error", exchange=name, error=str(exc))
+            log.warning("exchange_factory.skip", exchange=name, error=str(exc))
 
-    if not exchanges:
-        # Fall back to public-feed-only mode (no trading, useful for testing)
-        log.warning("exchange_factory.no_credentials", msg="Running in public-feed mode")
-        for name in ("binance", "bybit"):
-            ex = getattr(ccxtpro, name)({"enableRateLimit": True})
-            exchanges[name] = ex
-
+    log.info(
+        "exchange_factory.ready",
+        count=len(exchanges),
+        exchanges=list(exchanges.keys()),
+        note="Paper trading mode — no API keys needed",
+    )
     return exchanges
